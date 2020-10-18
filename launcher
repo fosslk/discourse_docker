@@ -1,28 +1,45 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 usage () {
   echo "Usage: launcher COMMAND CONFIG [--skip-prereqs] [--docker-args STRING]"
   echo "Commands:"
-  echo "    start:      Start/initialize a container"
-  echo "    stop:       Stop a running container"
-  echo "    restart:    Restart a container"
-  echo "    destroy:    Stop and remove a container"
-  echo "    enter:      Open a shell to run commands inside the container"
-  echo "    logs:       View the Docker logs for a container"
-  echo "    bootstrap:  Bootstrap a container for the config based on a template"
-  echo "    rebuild:    Rebuild a container (destroy old, bootstrap, start new)"
-  echo "    cleanup:    Remove all containers that have stopped for > 24 hours"
+  echo "    start:       Start/initialize a container"
+  echo "    stop:        Stop a running container"
+  echo "    restart:     Restart a container"
+  echo "    destroy:     Stop and remove a container"
+  echo "    enter:       Open a shell to run commands inside the container"
+  echo "    logs:        View the Docker logs for a container"
+  echo "    bootstrap:   Bootstrap a container for the config based on a template"
+  echo "    run:         Run the given command with the config in the context of the last bootstrapped image"
+  echo "    rebuild:     Rebuild a container (destroy old, bootstrap, start new)"
+  echo "    cleanup:     Remove all containers that have stopped for > 24 hours"
+  echo "    start-cmd:   Generate docker command used to start container"
   echo
   echo "Options:"
   echo "    --skip-prereqs             Don't check launcher prerequisites"
   echo "    --docker-args              Extra arguments to pass when running docker"
   echo "    --skip-mac-address         Don't assign a mac address"
+  echo "    --run-image                Override the image used for running the container"
   exit 1
 }
 
+# for potential re-exec later
+SAVED_ARGV=("$@")
+
 command=$1
 config=$2
+
+# user_args_argv is assigned once when the argument vector is parsed.
+user_args_argv=""
+# user_args is mutable:  its value may change when templates are parsed.
+# Superset of user_args_argv.
 user_args=""
+
+user_run_image=""
+
+if [[ $command == "run" ]]; then
+  run_command=$3
+fi
 
 while [ ${#} -gt 0 ]; do
   case "${1}" in
@@ -36,7 +53,12 @@ while [ ${#} -gt 0 ]; do
     SKIP_MAC_ADDRESS="1"
     ;;
   --docker-args)
-    user_args="$2"
+    user_args_argv="$2"
+    user_args="$user_args_argv"
+    shift
+    ;;
+  --run-image)
+    user_run_image="$2"
     shift
     ;;
   esac
@@ -44,12 +66,17 @@ while [ ${#} -gt 0 ]; do
   shift 1
 done
 
+if [ -z "$command" -o -z "$config" -a "$command" != "cleanup" ]; then
+  usage
+  exit 1
+fi
+
 # Docker doesn't like uppercase characters, spaces or special characters, catch it now before we build everything out and then find out
-re='[A-Z/ !@#$%^&*()+~`=]'
+re='[[:upper:]/ !@#$%^&*()+~`=]'
 if [[ $config =~ $re ]];
   then
     echo
-    echo "ERROR: Config name must not contain upper case characters, spaces or special characters. Correct config name and rerun $0."
+    echo "ERROR: Config name '$config' must not contain upper case characters, spaces or special characters. Correct config name and rerun $0."
     echo
     exit 1
 fi
@@ -64,8 +91,8 @@ git_rec_version='1.8.0'
 config_file=containers/"$config".yml
 cidbootstrap=cids/"$config"_bootstrap.cid
 local_discourse=local_discourse
-image=discourse/base:2.0.20180404
-docker_path=`which docker.io || which docker`
+image="discourse/base:2.0.20201004-2310"
+docker_path=`which docker.io 2> /dev/null || which docker`
 git_path=`which git`
 
 if [ "${SUPERVISED}" = "true" ]; then
@@ -120,6 +147,11 @@ install_docker() {
   exit 1
 }
 
+pull_image() {
+  # Add a single retry to work around dockerhub TLS errors
+  $docker_path pull $image || $docker_path pull $image
+}
+
 check_prereqs() {
 
   if [ -z $docker_path ]; then
@@ -136,9 +168,9 @@ check_prereqs() {
   fi
 
   # 2. running an approved storage driver?
-  if ! $docker_path info 2> /dev/null | egrep -q '^Storage Driver: (aufs|btrfs|zfs|overlay|overlay2)$'; then
+  if ! $docker_path info 2> /dev/null | egrep -q 'Storage Driver: (aufs|zfs|overlay2)$'; then
     echo "Your Docker installation is not using a supported storage driver.  If we were to proceed you may have a broken install."
-    echo "aufs is the recommended storage driver, although zfs/btrfs/overlay and overlay2 may work as well."
+    echo "overlay2 is the recommended storage driver, although zfs and aufs may work as well."
     echo "Other storage drivers are known to be problematic."
     echo "You can tell what filesystem you are using by running \"docker info\" and looking at the 'Storage Driver' line."
     echo
@@ -172,6 +204,8 @@ check_prereqs() {
     echo
     echo "Please be patient"
     echo
+
+    pull_image
   fi
 
   # 5. running recommended git version
@@ -206,12 +240,15 @@ check_prereqs() {
     echo "You have less than 5GB of free space on the disk where $safe_folder is located. You will need more space to continue"
     df -h $safe_folder
     echo
-    read -p "Would you like to attempt to recover space by cleaning docker images and containers in the system?(y/N)" -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]
-    then
-      docker system prune
-      echo "If the cleanup was successful, you may try again now"
+    if tty >/dev/null; then
+      read -p "Would you like to attempt to recover space by cleaning docker images and containers in the system?(y/N)" -n 1 -r
+      echo
+      if [[ $REPLY =~ ^[Yy]$ ]]
+      then
+        $docker_path container prune --force --filter until=1h >/dev/null
+        $docker_path image prune --all --force --filter until=1h >/dev/null
+        echo "If the cleanup was successful, you may try again now"
+      fi
     fi
     exit 1
   fi
@@ -321,10 +358,16 @@ set_template_info() {
         p e
        end
     end
+    env.each{|k,v| puts "*ERROR." if v.is_a?(Hash)}
     puts env.map{|k,v| "-e\n#{k}=#{v}" }.join("\n")
 RUBY
 
-    raw=`exec echo "$input" | $docker_path run $user_args --rm -i -a stdin -a stdout $image ruby -e "$env_ruby"`
+    tmp_input_file=$(mktemp)
+
+    echo "$input" > "$tmp_input_file"
+    raw=`exec cat "$tmp_input_file" | $docker_path run $user_args --rm -i -a stdin -a stdout $image ruby -e "$env_ruby"`
+
+    rm -f "$tmp_input_file"
 
     env=()
     ok=1
@@ -332,7 +375,7 @@ RUBY
       if [ "$i" == "*ERROR." ]; then
         ok=0
       elif [ -n "$i" ]; then
-        env[${#env[@]}]=$i
+        env[${#env[@]}]="${i//\{\{config\}\}/${config}}"
       fi
     done <<< "$raw"
 
@@ -342,11 +385,11 @@ RUBY
       exit 1
     fi
 
+    # labels
     read -r -d '' labels_ruby << 'RUBY'
     require 'yaml'
 
     input=STDIN.readlines.join
-    # default to UTF-8 for the dbs sake
     labels = {}
     input.split('_FILE_SEPERATOR_').each do |yml|
        yml.strip!
@@ -363,7 +406,12 @@ RUBY
     puts labels.map{|k,v| "-l\n#{k}=#{v}" }.join("\n")
 RUBY
 
-    raw=`exec echo "$input" | $docker_path run $user_args --rm -i -a stdin -a stdout $image ruby -e "$labels_ruby"`
+    tmp_input_file=$(mktemp)
+
+    echo "$input" > "$tmp_input_file"
+    raw=`exec cat "$tmp_input_file" | $docker_path run $user_args --rm -i -a stdin -a stdout $image ruby -e "$labels_ruby"`
+
+    rm -f "$tmp_input_file"
 
     labels=()
     ok=1
@@ -380,6 +428,52 @@ RUBY
       echo "YAML syntax error. Please check your containers/*.yml config files."
       exit 1
     fi
+
+    # expose
+    read -r -d '' ports_ruby << 'RUBY'
+    require 'yaml'
+
+    input=STDIN.readlines.join
+    ports = []
+    input.split('_FILE_SEPERATOR_').each do |yml|
+       yml.strip!
+       begin
+         ports += (YAML.load(yml)['expose'] || [])
+       rescue Psych::SyntaxError => e
+        puts e
+        puts "*ERROR."
+       rescue => e
+        puts yml
+        p e
+       end
+    end
+    puts ports.map { |p| p.to_s.include?(':') ? "-p\n#{p}" : "--expose\n#{p}" }.join("\n")
+RUBY
+
+    tmp_input_file=$(mktemp)
+
+    echo "$input" > "$tmp_input_file"
+    raw=`exec cat "$tmp_input_file" | $docker_path run $user_args --rm -i -a stdin -a stdout $image ruby -e "$ports_ruby"`
+
+    rm -f "$tmp_input_file"
+
+    ports=()
+    ok=1
+    while read i; do
+      if [ "$i" == "*ERROR." ]; then
+        ok=0
+      elif [ -n "$i" ]; then
+        ports[${#ports[@]}]=$i
+      fi
+    done <<< "$raw"
+
+    if [ "$ok" -ne 1 ]; then
+      echo "${ports[@]}"
+      echo "YAML syntax error. Please check your containers/*.yml config files."
+      exit 1
+    fi
+
+   merge_user_args
 }
 
 if [ -z $docker_path ]; then
@@ -387,31 +481,24 @@ if [ -z $docker_path ]; then
 fi
 
 [ "$command" == "cleanup" ] && {
-  echo
-  echo "The following command will"
-  echo "- Delete all docker images for old containers"
-  echo "- Delete all stopped and orphan containers"
-  echo
-  read -p "Are you sure (Y/n): " -n 1 -r && echo
-  if [[ $REPLY =~ ^[Yy]$ || ! $REPLY ]]
-    then
-      space=$(df /var/lib/docker | awk '{ print $4 }' | grep -v Available)
-      echo "Starting Cleanup (bytes free $space)"
+  $docker_path container prune --filter until=1h
+  $docker_path image prune --all --filter until=1h
 
-      STATE_DIR=./.gc-state scripts/docker-gc
+  if [ -d /var/discourse/shared/standalone/postgres_data_old ]; then
+    echo
+    echo "Old PostgreSQL backup data cluster detected taking up $(du -hs /var/discourse/shared/standalone/postgres_data_old | awk '{print $1}') detected"
+    read -p "Would you like to remove it? (Y/n): " -n 1 -r && echo
 
-      space=$(df /var/lib/docker | awk '{ print $4 }' | grep -v Available)
-      echo "Finished Cleanup (bytes free $space)"
-
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      echo "removing old PostgreSQL data cluster at /var/discourse/shared/standalone/postgres_data_old..."
+      rm -rf /var/discourse/shared/standalone/postgres_data_old*
     else
       exit 1
+    fi
   fi
+
   exit 0
 }
-
-if [ -z "$command" -a -z "$config" ]; then
-  usage
-fi
 
 if [ ! "$command" == "setup" ]; then
   if [[ ! -e $config_file ]]; then
@@ -442,6 +529,7 @@ run_stop() {
        )
      else
        echo "$config was not started !"
+       echo "./discourse-doctor may help diagnose the problem."
        exit 1
   fi
 }
@@ -450,7 +538,9 @@ set_run_image() {
   run_image=`cat $config_file | $docker_path run $user_args --rm -i -a stdin -a stdout $image ruby -e \
     "require 'yaml'; puts YAML.load(STDIN.readlines.join)['run_image']"`
 
-  if [ -z "$run_image" ]; then
+  if [ -n "$user_run_image" ]; then
+    run_image=$user_run_image
+  elif [ -z "$run_image" ]; then
     run_image="$local_discourse/$config"
   fi
 }
@@ -470,34 +560,42 @@ set_boot_command() {
   fi
 }
 
+merge_user_args() {
+  local docker_args
+
+  docker_args=`cat $config_file | $docker_path run $user_args --rm -i -a stdout -a stdin $image ruby -e \
+          "require 'yaml'; puts YAML.load(STDIN.readlines.join)['docker_args']"`
+
+  if [[ -n "$docker_args" ]]; then
+    user_args="$user_args_argv $docker_args"
+  fi
+}
+
 run_start() {
 
-   existing=`$docker_path ps | awk '{ print $1, $(NF) }' | grep " $config$" | awk '{ print $1 }'`
-   echo $existing
-   if [ ! -z $existing ]
+   if [ -z "$START_CMD_ONLY" ]
    then
-     echo "Nothing to do, your container has already started!"
-     exit 0
-   fi
+     existing=`$docker_path ps | awk '{ print $1, $(NF) }' | grep " $config$" | awk '{ print $1 }'`
+     echo $existing
+     if [ ! -z $existing ]
+     then
+       echo "Nothing to do, your container has already started!"
+       exit 0
+     fi
 
-   existing=`$docker_path ps -a | awk '{ print $1, $(NF) }' | grep " $config$" | awk '{ print $1 }'`
-   if [ ! -z $existing ]
-   then
-     echo "starting up existing container"
-     (
-       set -x
-       $docker_path start $config
-     )
-     exit 0
+     existing=`$docker_path ps -a | awk '{ print $1, $(NF) }' | grep " $config$" | awk '{ print $1 }'`
+     if [ ! -z $existing ]
+     then
+       echo "starting up existing container"
+       (
+         set -x
+         $docker_path start $config
+       )
+       exit 0
+     fi
    fi
 
    host_run
-
-   ports=`cat $config_file | $docker_path run $user_args --rm -i -a stdout -a stdin $image ruby -e \
-         "require 'yaml'; puts YAML.load(STDIN.readlines.join)['expose'].map{|p| \"-p #{p}\"}.join(' ')"`
-
-   docker_args=`cat $config_file | $docker_path run $user_args --rm -i -a stdout -a stdin $image ruby -e \
-          "require 'yaml'; puts YAML.load(STDIN.readlines.join)['docker_args']"`
 
    set_template_info
    set_volumes
@@ -535,9 +633,14 @@ run_start() {
       mac_address="--mac-address $($docker_path run $user_args -i --rm -a stdout -a stderr $image /bin/sh -c "echo $hostname | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/'")"
      fi
 
+     if [ ! -z "$START_CMD_ONLY" ] ; then
+       docker_path="true"
+     fi
+
      set -x
+
      $docker_path run --shm-size=512m $links $attach_on_run $restart_policy "${env[@]}" "${labels[@]}" -h "$hostname" \
-        -e DOCKER_HOST_IP="$docker_ip" --name $config -t $ports $volumes $mac_address $docker_args $user_args \
+        -e DOCKER_HOST_IP="$docker_ip" --name $config -t "${ports[@]}" $volumes $mac_address $user_args \
         $run_image $boot_command
 
    )
@@ -545,15 +648,27 @@ run_start() {
 
 }
 
+run_run() {
+  set_template_info
+  set_volumes
+  set_links
+  set_run_image
+
+  unset ERR
+  (exec $docker_path run --rm --shm-size=512m $user_args $links "${env[@]}" -e DOCKER_HOST_IP="$docker_ip" -i -a stdin -a stdout -a stderr $volumes $run_image \
+    /bin/bash -c "$run_command") || ERR=$?
+
+  if [[ $ERR > 0 ]]; then
+    exit 1
+  fi
+}
 
 run_bootstrap() {
-
-  # I got no frigging clue what this does, ask Sam Saffron. It RUNS STUFF ON THE HOST I GUESS?
   host_run
 
   # Is the image available?
   # If not, pull it here so the user is aware what's happening.
-  $docker_path history $image >/dev/null 2>&1 || $docker_path pull $image
+  $docker_path history $image >/dev/null 2>&1 || pull_image
 
   set_template_info
 
@@ -581,8 +696,14 @@ run_bootstrap() {
   echo $run_command
 
   unset ERR
-  (exec echo "$input" | $docker_path run --shm-size=512m $user_args $links "${env[@]}" -e DOCKER_HOST_IP="$docker_ip" --cidfile $cidbootstrap -i -a stdin -a stdout -a stderr $volumes $image \
+
+  tmp_input_file=$(mktemp)
+
+  echo "$input" > "$tmp_input_file"
+  (exec cat "$tmp_input_file" | $docker_path run --shm-size=512m $user_args $links "${env[@]}" -e DOCKER_HOST_IP="$docker_ip" --cidfile $cidbootstrap -i -a stdin -a stdout -a stderr $volumes $image \
     /bin/bash -c "$run_command") || ERR=$?
+
+  rm -f "$tmp_input_file"
 
   unset FAILED
   # magic exit code that indicates a retry
@@ -602,7 +723,8 @@ run_bootstrap() {
 
     $docker_path rm `cat $cidbootstrap`
     rm $cidbootstrap
-    echo "** FAILED TO BOOTSTRAP ** please scroll up and look for earlier error messages, there may be more than one"
+    echo "** FAILED TO BOOTSTRAP ** please scroll up and look for earlier error messages, there may be more than one."
+    echo "./discourse-doctor may help diagnose the problem."
     exit 1
   fi
 
@@ -612,12 +734,15 @@ run_bootstrap() {
   $docker_path rm `cat $cidbootstrap` && rm $cidbootstrap
 }
 
-
-
 case "$command" in
   bootstrap)
       run_bootstrap
       echo "Successfully bootstrapped, to startup use ./launcher start $config"
+      exit 0
+      ;;
+
+  run)
+      run_run
       exit 0
       ;;
 
@@ -642,6 +767,12 @@ case "$command" in
       exit 0
       ;;
 
+  start-cmd)
+    START_CMD_ONLY="1"
+    run_start
+    exit 0;
+    ;;
+
   start)
       run_start
       exit 0
@@ -653,22 +784,19 @@ case "$command" in
 
         git remote update
 
-        LOCAL=$(git rev-parse @)
+        LOCAL=$(git rev-parse HEAD)
         REMOTE=$(git rev-parse @{u})
-        BASE=$(git merge-base @ @{u})
+        BASE=$(git merge-base HEAD @{u})
 
         if [ $LOCAL = $REMOTE ]; then
           echo "Launcher is up-to-date"
 
         elif [ $LOCAL = $BASE ]; then
-          echo "Updating Launcher"
+          echo "Updating Launcher..."
           git pull || (echo 'failed to update' && exit 1)
 
-          for (( i=${#BASH_ARGV[@]}-1,j=0; i>=0,j<${#BASH_ARGV[@]}; i--,j++ ))
-          do
-            args[$j]=${BASH_ARGV[$i]}
-          done
-          exec /bin/bash $0 "${args[@]}" # $@ is empty, because of shift at the beginning. Use BASH_ARGV instead.
+          echo "Launcher updated, restarting..."
+          exec "$0" "${SAVED_ARGV[@]}"
 
         elif [ $REMOTE = $BASE ]; then
           echo "Your version of Launcher is ahead of origin"
@@ -686,7 +814,7 @@ case "$command" in
           echo "Stopping old container"
           (
             set -x
-            $docker_path stop -t 10 $config
+            $docker_path stop -t 60 $config
           )
       fi
 

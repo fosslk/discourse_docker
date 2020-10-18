@@ -53,7 +53,7 @@ Commands:
     destroy:    Stop and remove a container
     enter:      Use docker exec to enter a container
     logs:       Docker logs for container
-	memconfig:  Configure sane defaults for available RAM
+    memconfig:  Configure sane defaults for available RAM
     bootstrap:  Bootstrap a container for the config based on a template
     rebuild:    Rebuild a container (destroy old, bootstrap, start new)
 ```
@@ -82,7 +82,7 @@ expose:
   - "127.0.0.1:20080:80"
 ```
 
-Expose port 22 inside the container on port 2222 on ALL local host interfaces. In order to bind to only one interface, you may specify the host's IP address as `([<host_interface>:[host_port]])|(<host_port>):<container_port>[/udp]` as defined in the [docker port binding documentation](http://docs.docker.com/userguide/dockerlinks/)
+Publish port 22 inside the container on port 2222 on ALL local host interfaces. In order to bind to only one interface, you may specify the host's IP address as `([<host_interface>:[host_port]])|(<host_port>):<container_port>[/udp]` as defined in the [docker port binding documentation](http://docs.docker.com/userguide/dockerlinks/). To expose a port without publishing it, specify only the port number (e.g., `80`).
 
 
 #### volumes:
@@ -107,6 +107,20 @@ links:
 
 Links another container to the current container. This will add `--link postgres:postgres`
 to the options when running the container.
+
+#### environment variables:
+
+Setting environment variables to the current container.
+
+```
+# app.yml
+
+env:
+  DISCOURSE_DB_HOST: some-host
+  DISCOURSE_DB_NAME: {{config}}_discourse
+```
+
+The above will add `-e DISCOURSE_DB_HOST=some-host -e DISCOURSE_DB_NAME=app_discourse` to the options when running the container.
 
 #### labels:
 ```
@@ -182,23 +196,6 @@ installs you can ensure they are in sync by looking at `/etc/passwd` and
 - [Multisite configuration with Docker](https://meta.discourse.org/t/multisite-configuration-with-docker/14084)
 - [Linking containers for a multiple container setup](https://meta.discourse.org/t/linking-containers-for-a-multiple-container-setup/20867)
 - [Using Rubygems mirror to improve connection problem in China](https://meta.discourse.org/t/replace-rubygems-org-with-taobao-mirror-to-resolve-network-error-in-china/21988/1)
-
-### Developing with Vagrant
-
-If you are looking to make modifications to this repository, you can easily test
-out your changes before committing, using the magic of
-[Vagrant](http://vagrantup.com).  Install Vagrant as per [the default
-instructions](http://docs.vagrantup.com/v2/installation/index.html), and
-then run:
-
-    vagrant up
-
-This will spawn a new Ubuntu VM, install Docker, and then await your
-instructions.  You can then SSH into the VM with `vagrant ssh`, become
-`root` with `sudo -i`, and then you're right to go.  Your live git repo is
-already available at `/vagrant`, so you can just `cd /vagrant`
-and then start running `launcher`.
-
 
 License
 ===

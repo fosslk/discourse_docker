@@ -5,7 +5,7 @@ run:
      contents: |
         #!/bin/sh
         exec 2>&1
-        exec chpst -u redis -U redis /usr/bin/redis-server /etc/redis/redis.conf
+        exec thpoff chpst -u redis -U redis /usr/bin/redis-server /etc/redis/redis.conf
   - file:
      path: /etc/service/redis/log/run
      chmod: "+x"
@@ -47,6 +47,11 @@ run:
       filename: "/etc/redis/redis.conf"
       from: /^dir .*$/
       to: "dir /shared/redis_data"
+
+  - replace:
+      filename: "/etc/redis/redis.conf"
+      from: /^protected-mode yes/
+      to: "protected-mode no"
 
   - exec:
       cmd: echo redis installed
